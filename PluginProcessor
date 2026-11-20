@@ -1,0 +1,146 @@
+#include "PluginProcessor.h"
+
+namespace
+{
+    // 0 = Soft (tanh), 1 = Tube (asimetris, harmonik genap), 2 = Hard clip
+    inline float shape (float x, int type)
+    {
+        switch (type)
+        {
+            case 1:  return std::tanh (x + 0.25f) - std::tanh (0.25f);
+            case 2:  return juce::jlimit (-1.0f, 1.0f, x);
+            default: return std::tanh (x);
+        }
+    }
+}
+
+SaturationProcessor::SaturationProcessor()
+    : AudioProcessor (BusesProperties()
+                          .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts (*this, nullptr, "STATE", createLayout()),
+      oversampling (2, 2, juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, true)
+{
+}
+
+juce::AudioProcessorValueTreeState::ParameterLayout SaturationProcessor::createLayout()
+{
+    using namespace juce;
+    std::vector<std::unique_ptr<RangedAudioParameter>> p;
+
+    p.push_back (std::make_unique<AudioParameterFloat> (
+        ParameterID { "drive", 1 }, "Drive (dB)",
+        NormalisableRange<float> (0.0f, 36.0f, 0.1f), 12.0f));
+
+    p.push_back (std::make_unique<AudioParameterChoice> (
+        ParameterID { "type", 1 }, "Type",
+        StringArray { "Soft", "Tube", "Hard" }, 0));
+
+    p.push_back (std::make_unique<AudioParameterFloat> (
+        ParameterID { "mix", 1 }, "Mix",
+        NormalisableRange<float> (0.0f, 1.0f, 0.01f), 1.0f));
+
+    p.push_back (std::make_unique<AudioParameterFloat> (
+        ParameterID { "output", 1 }, "Output (dB)",
+        NormalisableRange<float> (-24.0f, 12.0f, 0.1f), 0.0f));
+
+    return { p.begin(), p.end() };
+}
+
+void SaturationProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+{
+    juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) samplesPerBlock, 2 };
+
+    oversampling.initProcessing ((size_t) samplesPerBlock);
+    oversampling.reset();
+
+    mixer.prepare (spec);
+    mixer.setWetLatency (oversampling.getLatencyInSamples());
+    setLatencySamples ((int) oversampling.getLatencyInSamples());
+
+    const auto drive = apvts.getRawParameterValue ("drive")->load();
+    const auto out   = apvts.getRawParameterValue ("output")->load();
+
+    driveSm.reset (sampleRate * 4.0, 0.02);
+    driveSm.setCurrentAndTargetValue (juce::Decibels::decibelsToGain (drive));
+    outSm.reset (sampleRate, 0.02);
+    outSm.setCurrentAndTargetValue (juce::Decibels::decibelsToGain (out));
+
+    for (int c = 0; c < 2; ++c) { dcX[c] = 0.f; dcY[c] = 0.f; }
+}
+
+bool SaturationProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+{
+    return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo()
+        && layouts.getMainInputChannelSet()  == juce::AudioChannelSet::stereo();
+}
+
+void SaturationProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    const int type = (int) apvts.getRawParameterValue ("type")->load();
+    const float mix = apvts.getRawParameterValue ("mix")->load();
+    driveSm.setTargetValue (juce::Decibels::decibelsToGain (apvts.getRawParameterValue ("drive")->load()));
+    outSm.setTargetValue   (juce::Decibels::decibelsToGain (apvts.getRawParameterValue ("output")->load()));
+
+    juce::dsp::AudioBlock<float> block (buffer);
+
+    mixer.setWetMixProportion (mix);
+    mixer.pushDrySamples (block);
+
+    // Saturasi pada sample rate 4x untuk mengurangi aliasing
+    auto up = oversampling.processSamplesUp (block);
+    const size_t nUp = up.getNumSamples();
+    for (size_t i = 0; i < nUp; ++i)
+    {
+        const float g = driveSm.getNextValue();
+        for (size_t c = 0; c < up.getNumChannels(); ++c)
+        {
+            float* d = up.getChannelPointer (c);
+            d[i] = shape (d[i] * g, type);
+        }
+    }
+    oversampling.processSamplesDown (block);
+
+    // DC blocker (untuk mode Tube) + output gain
+    const size_t n = block.getNumSamples();
+    for (size_t i = 0; i < n; ++i)
+    {
+        const float og = outSm.getNextValue();
+        for (size_t c = 0; c < block.getNumChannels(); ++c)
+        {
+            float* d = block.getChannelPointer (c);
+            const float x = d[i];
+            const float y = x - dcX[c] + 0.995f * dcY[c];
+            dcX[c] = x;
+            dcY[c] = y;
+            d[i] = y * og;
+        }
+    }
+
+    mixer.mixWetSamples (block);
+}
+
+juce::AudioProcessorEditor* SaturationProcessor::createEditor()
+{
+    return new juce::GenericAudioProcessorEditor (*this);
+}
+
+void SaturationProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    if (auto xml = apvts.copyState().createXml())
+        copyXmlToBinary (*xml, destData);
+}
+
+void SaturationProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    if (auto xml = getXmlFromBinary (data, sizeInBytes))
+        if (xml->hasTagName (apvts.state.getType()))
+            apvts.replaceState (juce::ValueTree::fromXml (*xml));
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new SaturationProcessor();
+}
